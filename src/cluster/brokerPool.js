@@ -2,6 +2,7 @@ const Broker = require('../broker')
 const createRetry = require('../retry')
 const shuffle = require('../utils/shuffle')
 const arrayDiff = require('../utils/arrayDiff')
+const sharedPromiseTo = require('../utils/sharedPromiseTo')
 const { KafkaJSBrokerNotFound, KafkaJSProtocolError } = require('../errors')
 
 const { keys, assign, values } = Object
@@ -50,6 +51,7 @@ module.exports = class BrokerPool {
     /** @type {import("../../types").BrokerMetadata | null} */
     this.metadata = null
     this.metadataExpireAt = null
+    this.sharedPromiseToRefreshMetadata = sharedPromiseTo()
     this.versions = null
     this.supportAuthenticationProtocol = null
   }
@@ -153,69 +155,71 @@ module.exports = class BrokerPool {
    * @returns {Promise<null>}
    */
   async refreshMetadata(topics) {
-    const broker = await this.findConnectedBroker()
-    const { host: seedHost, port: seedPort } = this.seedBroker.connection
+    return await this.sharedPromiseToRefreshMetadata(async () => {
+      const broker = await this.findConnectedBroker()
+      const { host: seedHost, port: seedPort } = this.seedBroker.connection
 
-    return this.retrier(async (bail, retryCount, retryTime) => {
-      try {
-        this.metadata = await broker.metadata(topics)
-        this.metadataExpireAt = Date.now() + this.metadataMaxAge
+      return this.retrier(async (bail, retryCount, retryTime) => {
+        try {
+          this.metadata = await broker.metadata(topics)
+          this.metadataExpireAt = Date.now() + this.metadataMaxAge
 
-        const replacedBrokers = []
+          const replacedBrokers = []
 
-        this.brokers = await this.metadata.brokers.reduce(
-          async (resultPromise, { nodeId, host, port, rack }) => {
-            const result = await resultPromise
+          this.brokers = await this.metadata.brokers.reduce(
+            async (resultPromise, { nodeId, host, port, rack }) => {
+              const result = await resultPromise
 
-            if (result[nodeId]) {
-              if (!hasBrokerBeenReplaced(result[nodeId], { host, port, rack })) {
-                return result
+              if (result[nodeId]) {
+                if (!hasBrokerBeenReplaced(result[nodeId], { host, port, rack })) {
+                  return result
+                }
+
+                replacedBrokers.push(result[nodeId])
               }
 
-              replacedBrokers.push(result[nodeId])
-            }
+              if (host === seedHost && port === seedPort) {
+                this.seedBroker.nodeId = nodeId
+                this.seedBroker.connection.rack = rack
+                return assign(result, {
+                  [nodeId]: this.seedBroker,
+                })
+              }
 
-            if (host === seedHost && port === seedPort) {
-              this.seedBroker.nodeId = nodeId
-              this.seedBroker.connection.rack = rack
               return assign(result, {
-                [nodeId]: this.seedBroker,
+                [nodeId]: this.createBroker({
+                  logger: this.rootLogger,
+                  versions: this.versions,
+                  supportAuthenticationProtocol: this.supportAuthenticationProtocol,
+                  connection: await this.connectionBuilder.build({ host, port, rack }),
+                  nodeId,
+                }),
               })
-            }
+            },
+            this.brokers
+          )
 
-            return assign(result, {
-              [nodeId]: this.createBroker({
-                logger: this.rootLogger,
-                versions: this.versions,
-                supportAuthenticationProtocol: this.supportAuthenticationProtocol,
-                connection: await this.connectionBuilder.build({ host, port, rack }),
-                nodeId,
-              }),
+          const freshBrokerIds = this.metadata.brokers.map(({ nodeId }) => `${nodeId}`).sort()
+          const currentBrokerIds = keys(this.brokers).sort()
+          const unusedBrokerIds = arrayDiff(currentBrokerIds, freshBrokerIds)
+
+          const brokerDisconnects = unusedBrokerIds.map(nodeId => {
+            const broker = this.brokers[nodeId]
+            return broker.disconnect().then(() => {
+              delete this.brokers[nodeId]
             })
-          },
-          this.brokers
-        )
-
-        const freshBrokerIds = this.metadata.brokers.map(({ nodeId }) => `${nodeId}`).sort()
-        const currentBrokerIds = keys(this.brokers).sort()
-        const unusedBrokerIds = arrayDiff(currentBrokerIds, freshBrokerIds)
-
-        const brokerDisconnects = unusedBrokerIds.map(nodeId => {
-          const broker = this.brokers[nodeId]
-          return broker.disconnect().then(() => {
-            delete this.brokers[nodeId]
           })
-        })
 
-        const replacedBrokersDisconnects = replacedBrokers.map(broker => broker.disconnect())
-        await Promise.all([...brokerDisconnects, ...replacedBrokersDisconnects])
-      } catch (e) {
-        if (e.type === 'LEADER_NOT_AVAILABLE') {
-          throw e
+          const replacedBrokersDisconnects = replacedBrokers.map(broker => broker.disconnect())
+          await Promise.all([...brokerDisconnects, ...replacedBrokersDisconnects])
+        } catch (e) {
+          if (e.type === 'LEADER_NOT_AVAILABLE') {
+            throw e
+          }
+
+          bail(e)
         }
-
-        bail(e)
-      }
+      })
     })
   }
 

@@ -7,6 +7,13 @@ module.exports = class SeekOffsets extends Map {
     return Array.from(this.keys()).some(([t, p]) => t === topic && p === partition)
   }
 
+  remove(topic, partition) {
+    const key = [topic, partition]
+    const offset = this.get(key)
+    this.delete(key)
+    return { topic, partition, offset }
+  }
+
   pop() {
     if (this.size === 0) {
       return

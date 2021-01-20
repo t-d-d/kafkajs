@@ -206,7 +206,7 @@ module.exports = ({
   /** @type {import("../../types").Consumer["run"]} */
   const run = async ({
     autoCommit = true,
-    autoCommitInterval = null,
+    autoCommitInterval = 5000,
     autoCommitThreshold = null,
     eachBatchAutoResolve = true,
     partitionsConsumedConcurrently = 1,

@@ -1,16 +1,26 @@
+const { parallelMerge } = require('streaming-iterables')
+
 const flatten = require('../utils/flatten')
 const sleep = require('../utils/sleep')
-const BufferedAsyncIterator = require('../utils/bufferedAsyncIterator')
 const websiteUrl = require('../utils/websiteUrl')
 const arrayDiff = require('../utils/arrayDiff')
 const createRetry = require('../retry')
+const sharedPromiseTo = require('../utils/sharedPromiseTo')
 
 const OffsetManager = require('./offsetManager')
 const Batch = require('./batch')
 const SeekOffsets = require('./seekOffsets')
 const SubscriptionState = require('./subscriptionState')
 const {
-  events: { GROUP_JOIN, HEARTBEAT, CONNECT, RECEIVED_UNSUBSCRIBED_TOPICS },
+  events: {
+    GROUP_JOIN,
+    HEARTBEAT,
+    CONNECT,
+    DISCONNECT,
+    RECEIVED_UNSUBSCRIBED_TOPICS,
+    FETCH_START,
+    FETCH,
+  },
 } = require('./instrumentationEvents')
 const { MemberAssignment } = require('./assignerProtocol')
 const {
@@ -37,6 +47,8 @@ const isRebalancing = e =>
 const PRIVATE = {
   JOIN: Symbol('private:ConsumerGroup:join'),
   SYNC: Symbol('private:ConsumerGroup:sync'),
+  getBrokerAsyncGenerator: Symbol('private:ConsumerGroup:createBrokerAsyncIterator'),
+  emitBrokerFetchStart: Symbol('private:ConsumerGroup:emitBrokerFetchStart'),
 }
 
 module.exports = class ConsumerGroup {
@@ -107,6 +119,13 @@ module.exports = class ConsumerGroup {
     this.subscriptionState = new SubscriptionState()
 
     this.lastRequest = Date.now()
+
+    this.running = true
+
+    this.sharedPromiseToToHeartbeat = sharedPromiseTo()
+    this.sharedPromiseToToJoinAndSync = sharedPromiseTo()
+
+    this.brokerAsyncIterators = {}
   }
 
   isLeader() {
@@ -116,7 +135,22 @@ module.exports = class ConsumerGroup {
   async connect() {
     await this.cluster.connect()
     this.instrumentationEmitter.emit(CONNECT)
-    await this.cluster.refreshMetadataIfNecessary()
+
+    const metadata = await this.cluster.metadata()
+    const batchIterator = parallelMerge(
+      ...metadata.brokers.map(({ nodeId }) => this[PRIVATE.getBrokerAsyncGenerator](nodeId)())
+    )
+    this.running = true
+
+    await this.joinAndSync()
+
+    return batchIterator
+  }
+
+  async disconnect() {
+    this.running = false
+    this.instrumentationEmitter.emit(DISCONNECT)
+    await this.leave()
   }
 
   async [PRIVATE.JOIN]() {
@@ -286,49 +320,46 @@ module.exports = class ConsumerGroup {
     })
   }
 
-  joinAndSync() {
-    const startJoin = Date.now()
-    return this.retrier(async bail => {
-      try {
-        await this[PRIVATE.JOIN]()
-        await this[PRIVATE.SYNC]()
+  async joinAndSync() {
+    return await this.sharedPromiseToToJoinAndSync(async () => {
+      const startJoin = Date.now()
+      return this.retrier(async bail => {
+        try {
+          await this[PRIVATE.JOIN]()
+          await this[PRIVATE.SYNC]()
 
-        const memberAssignment = this.assigned().reduce(
-          (result, { topic, partitions }) => ({ ...result, [topic]: partitions }),
-          {}
-        )
+          const memberAssignment = this.assigned().reduce(
+            (result, { topic, partitions }) => ({ ...result, [topic]: partitions }),
+            {}
+          )
 
-        const payload = {
-          groupId: this.groupId,
-          memberId: this.memberId,
-          leaderId: this.leaderId,
-          isLeader: this.isLeader(),
-          memberAssignment,
-          groupProtocol: this.groupProtocol,
-          duration: Date.now() - startJoin,
+          const payload = {
+            groupId: this.groupId,
+            memberId: this.memberId,
+            leaderId: this.leaderId,
+            isLeader: this.isLeader(),
+            memberAssignment,
+            groupProtocol: this.groupProtocol,
+            duration: Date.now() - startJoin,
+          }
+
+          this.instrumentationEmitter.emit(GROUP_JOIN, payload)
+          this.logger.info('Consumer has joined the group', payload)
+
+          await this.offsetManager.resolveOffsets() // TODO Is this correct place?
+        } catch (e) {
+          if (isRebalancing(e)) {
+            // Rebalance in progress isn't a retriable protocol error since the consumer
+            // has to go through find coordinator and join again before it can
+            // actually retry the operation. We wrap the original error in a retriable error
+            // here instead in order to restart the join + sync sequence using the retrier.
+            throw new KafkaJSError(e)
+          }
+
+          bail(e)
         }
-
-        this.instrumentationEmitter.emit(GROUP_JOIN, payload)
-        this.logger.info('Consumer has joined the group', payload)
-      } catch (e) {
-        if (isRebalancing(e)) {
-          // Rebalance in progress isn't a retriable protocol error since the consumer
-          // has to go through find coordinator and join again before it can
-          // actually retry the operation. We wrap the original error in a retriable error
-          // here instead in order to restart the join + sync sequence using the retrier.
-          throw new KafkaJSError(e)
-        }
-
-        bail(e)
-      }
+      })
     })
-  }
-
-  /**
-   * @param {import("../../types").TopicPartition} topicPartition
-   */
-  resetOffset({ topic, partition }) {
-    this.offsetManager.resetOffset({ topic, partition })
   }
 
   /**
@@ -384,198 +415,183 @@ module.exports = class ConsumerGroup {
   }
 
   async heartbeat({ interval }) {
-    const { groupId, generationId, memberId } = this
-    const now = Date.now()
+    return await this.sharedPromiseToToHeartbeat(async () => {
+      const { groupId, generationId, memberId } = this
+      const now = Date.now()
 
-    if (memberId && now >= this.lastRequest + interval) {
-      const payload = {
-        groupId,
-        memberId,
-        groupGenerationId: generationId,
+      if (memberId && now >= this.lastRequest + interval) {
+        const payload = {
+          groupId,
+          memberId,
+          groupGenerationId: generationId,
+        }
+
+        await this.coordinator.heartbeat(payload)
+        this.instrumentationEmitter.emit(HEARTBEAT, payload)
+        this.lastRequest = Date.now()
       }
+    })
+  }
 
-      await this.coordinator.heartbeat(payload)
-      this.instrumentationEmitter.emit(HEARTBEAT, payload)
-      this.lastRequest = Date.now()
+  [PRIVATE.emitBrokerFetchStart]({ nodeId }) {
+    const emitAndReset = () => {
+      this.instrumentationEmitter.emit(FETCH_START, {})
+      this.instrumentationEmitter.emit(FETCH, {
+        duration: 1,
+        numberOfBatches: 0,
+      })
+      this.brokerFetchStarts = Object.keys(this.brokerAsyncIterators).map(brokerId => ({
+        [brokerId]: 0,
+      }))
+    }
+
+    if (!this.brokerFetchStarts) {
+      // First time through
+      emitAndReset()
+      this.brokerFetchStarts[nodeId]++
+      return
+    }
+
+    this.brokerFetchStarts[nodeId]++
+    if (Object.values(this.brokerFetchStarts).every(count => count > 0)) {
+      emitAndReset()
     }
   }
 
-  async fetch() {
-    try {
-      const { topics, maxBytesPerPartition, maxWaitTime, minBytes, maxBytes } = this
-      /** @type {{[nodeId: string]: {topic: string, partitions: { partition: number; fetchOffset: string; maxBytes: number }[]}[]}} */
-      const requestsPerNode = {}
+  [PRIVATE.getBrokerAsyncGenerator](nodeId) {
+    if (this.brokerAsyncIterators[nodeId]) return this.brokerAsyncIterators[nodeId]
+    this.brokerAsyncIterators[nodeId] = async function* brokerAsyncGenerator() {
+      while (this.running) {
+        this[PRIVATE.emitBrokerFetchStart]({ nodeId })
 
-      await this.cluster.refreshMetadataIfNecessary()
-      this.checkForStaleAssignment()
+        const { requestsForNode, responses } = await this.retrier(
+          async (bail, retryCount, retryTime) => {
+            try {
+              const { maxBytesPerPartition, maxWaitTime, minBytes, maxBytes } = this
 
-      while (this.seekOffset.size > 0) {
-        const seekEntry = this.seekOffset.pop()
-        this.logger.debug('Seek offset', {
-          groupId: this.groupId,
-          memberId: this.memberId,
-          seek: seekEntry,
-        })
-        await this.offsetManager.seek(seekEntry)
-      }
+              await this.cluster.refreshMetadataIfNecessary()
+              this.checkForStaleAssignment()
 
-      const pausedTopicPartitions = this.subscriptionState.paused()
-      const activeTopicPartitions = this.subscriptionState.active()
+              /** @type {{topic: string, partitions: { partition: number; fetchOffset: string; maxBytes: number }[]} */
+              const requestsForNode = []
 
-      const activePartitions = flatten(activeTopicPartitions.map(({ partitions }) => partitions))
-      const activeTopics = activeTopicPartitions
-        .filter(({ partitions }) => partitions.length > 0)
-        .map(({ topic }) => topic)
+              for (const topicPartition of this.subscriptionState.active()) {
+                const partitionsForNode =
+                  this.findReadReplicaForPartitions(
+                    topicPartition.topic,
+                    topicPartition.partitions
+                  )[nodeId] || []
 
-      if (activePartitions.length === 0) {
-        this.logger.debug(`No active topic partitions, sleeping for ${this.maxWaitTime}ms`, {
-          topics,
-          activeTopicPartitions,
-          pausedTopicPartitions,
-        })
+                const partitions = partitionsForNode.map(partition => ({
+                  partition,
+                  fetchOffset: this.offsetManager
+                    .nextOffset(topicPartition.topic, partition)
+                    .toString(),
+                  maxBytes: maxBytesPerPartition,
+                }))
 
-        await sleep(this.maxWaitTime)
-        return BufferedAsyncIterator([])
-      }
+                requestsForNode.push({ topic: topicPartition.topic, partitions })
+              }
 
-      await this.offsetManager.resolveOffsets()
+              if (requestsForNode.length === 0) return { requestsForNode, responses: [] }
 
-      this.logger.debug(
-        `Fetching from ${activePartitions.length} partitions for ${activeTopics.length} out of ${topics.length} topics`,
-        {
-          topics,
-          activeTopicPartitions,
-          pausedTopicPartitions,
-        }
-      )
+              for (const { topic, partitions } of requestsForNode) {
+                for (const partition of partitions) {
+                  if (this.seekOffset.has(topic, partition)) {
+                    const seekEntry = this.seekOffset.remove(topic, partition)
+                    this.logger.debug('Seek offset', {
+                      groupId: this.groupId,
+                      memberId: this.memberId,
+                      seek: seekEntry,
+                    })
+                    await this.offsetManager.seek(seekEntry)
+                  }
+                }
+              }
 
-      for (const topicPartition of activeTopicPartitions) {
-        const partitionsPerNode = this.findReadReplicaForPartitions(
-          topicPartition.topic,
-          topicPartition.partitions
+              const broker = await this.cluster.findBroker({ nodeId })
+              const response = await broker.fetch({
+                maxWaitTime,
+                minBytes,
+                maxBytes,
+                isolationLevel: this.isolationLevel,
+                topics: requestsForNode,
+                rackId: this.rackId,
+              })
+              return {
+                requestsForNode,
+                responses: response.responses,
+              }
+            } catch (e) {
+              return await this.recoverFromFetch(e, bail, retryCount, retryTime)
+            }
+          }
         )
 
-        const nodeIds = keys(partitionsPerNode)
-        const committedOffsets = this.offsetManager.committedOffsets()
+        const filteredTopicPartitions = responses.map(({ topicName, partitions }) => ({
+          topicName,
+          partitions: partitions.filter(
+            partitionData =>
+              !this.seekOffset.has(topicName, partitionData.partition) &&
+              !this.subscriptionState.isPaused(topicName, partitionData.partition)
+          ),
+        }))
 
-        for (const nodeId of nodeIds) {
-          const partitions = partitionsPerNode[nodeId]
-            .filter(partition => {
-              /**
-               * When recovering from OffsetOutOfRange, each partition can recover
-               * concurrently, which invalidates resolved and committed offsets as part
-               * of the recovery mechanism (see OffsetManager.clearOffsets). In concurrent
-               * scenarios this can initiate a new fetch with invalid offsets.
-               *
-               * This was further highlighted by https://github.com/tulios/kafkajs/pull/570,
-               * which increased concurrency, making this more likely to happen.
-               *
-               * This is solved by only making requests for partitions with initialized offsets.
-               *
-               * See the following pull request which explains the context of the problem:
-               * @issue https://github.com/tulios/kafkajs/pull/578
-               */
-              return committedOffsets[topicPartition.topic][partition] != null
-            })
-            .map(partition => ({
-              partition,
-              fetchOffset: this.offsetManager
-                .nextOffset(topicPartition.topic, partition)
-                .toString(),
-              maxBytes: maxBytesPerPartition,
-            }))
+        const batchesPerPartition = filteredTopicPartitions.map(({ topicName, partitions }) => {
+          const topicRequestData = requestsForNode.find(({ topic }) => topic === topicName)
 
-          requestsPerNode[nodeId] = requestsPerNode[nodeId] || []
-          requestsPerNode[nodeId].push({ topic: topicPartition.topic, partitions })
-        }
-      }
-
-      const requests = keys(requestsPerNode).map(async nodeId => {
-        const broker = await this.cluster.findBroker({ nodeId })
-        const { responses } = await broker.fetch({
-          maxWaitTime,
-          minBytes,
-          maxBytes,
-          isolationLevel: this.isolationLevel,
-          topics: requestsPerNode[nodeId],
-          rackId: this.rackId,
+          return partitions.map(partitionData => {
+            const fetchOffset = topicRequestData.partitions.find(
+              ({ partition }) => partition === partitionData.partition
+            ).fetchOffset
+            return new Batch(topicName, fetchOffset, partitionData)
+          })
         })
 
-        const batchesPerPartition = responses.map(({ topicName, partitions }) => {
-          const topicRequestData = requestsPerNode[nodeId].find(({ topic }) => topic === topicName)
+        for (const batch of flatten(batchesPerPartition)) yield batch
+
+        if (requestsForNode.length === 0) await sleep(this.maxWaitTime) // Prevent busy-loop if no request actually made
+
+        // At this point all batches have been processed - safe to move partitions between brokers
+        filteredTopicPartitions.forEach(({ topicName, partitions }) => {
           let preferredReadReplicas = this.preferredReadReplicasPerTopicPartition[topicName]
           if (!preferredReadReplicas) {
             this.preferredReadReplicasPerTopicPartition[topicName] = preferredReadReplicas = {}
           }
 
-          return partitions
-            .filter(
-              partitionData =>
-                !this.seekOffset.has(topicName, partitionData.partition) &&
-                !this.subscriptionState.isPaused(topicName, partitionData.partition)
-            )
-            .map(partitionData => {
-              const { partition, preferredReadReplica } = partitionData
-              if (preferredReadReplica != null && preferredReadReplica !== -1) {
-                const { nodeId: currentPreferredReadReplica } =
-                  preferredReadReplicas[partition] || {}
-                if (currentPreferredReadReplica !== preferredReadReplica) {
-                  this.logger.info(`Preferred read replica is now ${preferredReadReplica}`, {
-                    groupId: this.groupId,
-                    memberId: this.memberId,
-                    topic: topicName,
-                    partition,
-                  })
-                }
-                preferredReadReplicas[partition] = {
-                  nodeId: preferredReadReplica,
-                  expireAt: Date.now() + this.metadataMaxAge,
-                }
-              }
-
-              const partitionRequestData = topicRequestData.partitions.find(
-                ({ partition }) => partition === partitionData.partition
-              )
-
-              const fetchedOffset = partitionRequestData.fetchOffset
-              const batch = new Batch(topicName, fetchedOffset, partitionData)
-
-              /**
-               * Resolve the offset to skip the control batch since `eachBatch` or `eachMessage` callbacks
-               * won't process empty batches
-               *
-               * @see https://github.com/apache/kafka/blob/9aa660786e46c1efbf5605a6a69136a1dac6edb9/clients/src/main/java/org/apache/kafka/clients/consumer/internals/Fetcher.java#L1499-L1505
-               */
-              if (batch.isEmptyControlRecord() || batch.isEmptyDueToLogCompactedMessages()) {
-                this.resolveOffset({
-                  topic: batch.topic,
-                  partition: batch.partition,
-                  offset: batch.lastOffset(),
+          partitions.forEach(({ partition, preferredReadReplica }) => {
+            if (preferredReadReplica != null && preferredReadReplica !== -1) {
+              const { nodeId: currentPreferredReadReplica } = preferredReadReplicas[partition] || {}
+              if (currentPreferredReadReplica !== preferredReadReplica) {
+                this.logger.info(`Preferred read replica is now ${preferredReadReplica}`, {
+                  groupId: this.groupId,
+                  memberId: this.memberId,
+                  topic: topicName,
+                  partition,
                 })
               }
-
-              return batch
-            })
+              preferredReadReplicas[partition] = {
+                nodeId: preferredReadReplica,
+                expireAt: Date.now() + this.metadataMaxAge,
+              }
+            }
+          })
         })
-
-        return flatten(batchesPerPartition)
-      })
-
-      // fetch can generate empty requests when the consumer group receives an assignment
-      // with more topics than the subscribed, so to prevent a busy loop we wait the
-      // configured max wait time
-      if (requests.length === 0) {
-        await sleep(this.maxWaitTime)
-        return BufferedAsyncIterator([])
       }
-
-      return BufferedAsyncIterator(requests, e => this.recoverFromFetch(e))
-    } catch (e) {
-      await this.recoverFromFetch(e)
-    }
+    }.bind(this)
+    return this.brokerAsyncIterators[nodeId]
   }
 
-  async recoverFromFetch(e) {
+  async recoverFromFetch(e, bail, retryCount, retryTime) {
+    if (!this.running) {
+      this.logger.debug('consumer not running, exiting', {
+        error: e.message,
+        groupId: this.consumerGroup.groupId,
+        memberId: this.consumerGroup.memberId,
+      })
+      return []
+    }
+
     if (STALE_METADATA_ERRORS.includes(e.type) || e.name === 'KafkaJSTopicMetadataNotLoaded') {
       this.logger.debug('Stale cluster metadata, refreshing...', {
         groupId: this.groupId,
@@ -586,6 +602,11 @@ module.exports = class ConsumerGroup {
       await this.cluster.refreshMetadata()
       await this.joinAndSync()
       throw new KafkaJSError(e.message)
+    }
+
+    if (e.name === 'KafkaJSOffsetOutOfRange') {
+      await this.recoverFromOffsetOutOfRange(e)
+      return []
     }
 
     if (e.name === 'KafkaJSStaleTopicMetadataAssignment') {
@@ -599,10 +620,6 @@ module.exports = class ConsumerGroup {
       await this.joinAndSync()
     }
 
-    if (e.name === 'KafkaJSOffsetOutOfRange') {
-      await this.recoverFromOffsetOutOfRange(e)
-    }
-
     if (e.name === 'KafkaJSConnectionClosedError') {
       this.cluster.removeBroker({ host: e.host, port: e.port })
     }
@@ -611,6 +628,15 @@ module.exports = class ConsumerGroup {
       this.logger.debug(`${e.message}, refreshing metadata and retrying...`)
       await this.cluster.refreshMetadata()
     }
+
+    this.logger.debug('Error while fetching data, trying again...', {
+      groupId: this.consumerGroup.groupId,
+      memberId: this.consumerGroup.memberId,
+      error: e.message,
+      stack: e.stack,
+      retryCount,
+      retryTime,
+    })
 
     throw e
   }

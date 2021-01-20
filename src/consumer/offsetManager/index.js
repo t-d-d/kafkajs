@@ -95,13 +95,6 @@ module.exports = class OffsetManager {
   }
 
   /**
-   * @param {import("../../../types").TopicPartition} topicPartition
-   */
-  resetOffset({ topic, partition }) {
-    this.resolvedOffsets[topic][partition] = this.committedOffsets()[topic][partition]
-  }
-
-  /**
    * @param {import("../../../types").TopicPartitionOffset} topicPartitionOffset
    */
   resolveOffset({ topic, partition, offset }) {
@@ -195,7 +188,8 @@ module.exports = class OffsetManager {
       ],
     })
 
-    this.clearOffsets({ topic, partition })
+    // TODO don't fully understand this. Is this change OK?
+    this.resolvedOffsets[topic][partition] = this.committedOffsets()[topic][partition] = offset
   }
 
   async commitOffsetsIfNecessary() {
