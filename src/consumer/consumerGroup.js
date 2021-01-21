@@ -1,3 +1,4 @@
+// eslint-disable-next-line node/no-extraneous-require
 const { parallelMerge } = require('streaming-iterables')
 
 const flatten = require('../utils/flatten')

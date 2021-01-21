@@ -75,6 +75,7 @@ module.exports = ({
   const topics = {}
   let runner = null
   let consumerGroup = null
+  let cancelRestartTimer = null
 
   if (heartbeatInterval >= sessionTimeout) {
     throw new KafkaJSNonRetriableError(
@@ -142,6 +143,8 @@ module.exports = ({
       await stop()
       logger.debug('consumer has stopped, disconnecting', { groupId })
       await cluster.disconnect()
+      cancelRestartTimer && cancelRestartTimer()
+      cancelRestartTimer = null
       instrumentationEmitter.emit(DISCONNECT)
     } catch (e) {}
   }
@@ -284,7 +287,7 @@ module.exports = ({
         restart: shouldRestart,
       })
 
-      if (shouldRestart) {
+      if (shouldRestart && !cancelRestartTimer) {
         const retryTime = e.retryTime || (retry && retry.initialRetryTime) || initialRetryTime
         logger.error(`Restarting the consumer in ${retryTime}ms`, {
           retryCount: e.retryCount,
@@ -292,7 +295,7 @@ module.exports = ({
           groupId,
         })
 
-        setTimeout(() => restart(onCrash), retryTime)
+        cancelRestartTimer = setTimeout(() => restart(onCrash), retryTime)
       }
     }
 

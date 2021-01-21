@@ -1,4 +1,5 @@
 const { EventEmitter } = require('events')
+// eslint-disable-next-line node/no-extraneous-require
 const { transform, consume } = require('streaming-iterables')
 
 const Long = require('../utils/long')
@@ -83,8 +84,8 @@ module.exports = class Runner extends EventEmitter {
 
     this.running = true
 
-    const batchIterator = await this.consumerGroup.connect()
-    this.promiseToEnd = this.runLoop(batchIterator).catch(this.onCrash)
+    const batchIterator = await this.consumerGroup.connect().catch(this.onCrash)
+    this.promiseToEnd = this.runLoop(batchIterator)
   }
 
   async stop() {
@@ -159,9 +160,11 @@ module.exports = class Runner extends EventEmitter {
       })
     }
 
-    await consume(transform(this.partitionsConsumedConcurrently, process, batchIterator)).catch(
-      this.onCrash
-    )
+    try {
+      await consume(transform(this.partitionsConsumedConcurrently, process, batchIterator))
+    } catch (e) {
+      this.onCrash(e)
+    }
   }
 
   async processBatch(batch) {
