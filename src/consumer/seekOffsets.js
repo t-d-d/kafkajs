@@ -1,27 +1,20 @@
-module.exports = class SeekOffsets extends Map {
+module.exports = class SeekOffsets {
+  constructor() {
+    this.offsets = {}
+  }
+
   set(topic, partition, offset) {
-    super.set([topic, partition], offset)
+    if (!this.offsets[topic]) this.offsets[topic] = {}
+    this.offsets[topic][partition] = offset
   }
 
   has(topic, partition) {
-    return Array.from(this.keys()).some(([t, p]) => t === topic && p === partition)
+    return this.offsets[topic] && this.offsets[topic][partition]
   }
 
   remove(topic, partition) {
-    const key = [topic, partition]
-    const offset = this.get(key)
-    this.delete(key)
-    return { topic, partition, offset }
-  }
-
-  pop() {
-    if (this.size === 0) {
-      return
-    }
-
-    const [key, offset] = this.entries().next().value
-    this.delete(key)
-    const [topic, partition] = key
-    return { topic, partition, offset }
+    const oldOffset = this.offsets[topic][partition]
+    delete this.offsets[topic][partition]
+    return oldOffset
   }
 }

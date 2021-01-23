@@ -441,9 +441,13 @@ module.exports = class ConsumerGroup {
         duration: 1,
         numberOfBatches: 0,
       })
-      this.brokerFetchStarts = Object.keys(this.brokerAsyncIterators).map(brokerId => ({
-        [brokerId]: 0,
-      }))
+      this.brokerFetchStarts = Object.keys(this.brokerAsyncIterators).reduce(
+        (a, brokerId) => ({
+          ...a,
+          [brokerId]: 0,
+        }),
+        {}
+      )
     }
 
     if (!this.brokerFetchStarts) {
@@ -467,51 +471,46 @@ module.exports = class ConsumerGroup {
 
         const { requestsForNode, responses } = await this.retrier(
           async (bail, retryCount, retryTime) => {
-            try {
-              const { maxBytesPerPartition, maxWaitTime, minBytes, maxBytes } = this
+            const { maxBytesPerPartition, maxWaitTime, minBytes, maxBytes } = this
+            /** @type {{topic: string, partitions: { partition: number; fetchOffset: string; maxBytes: number }[]} */
+            const requestsForNode = []
 
+            try {
               await this.cluster.refreshMetadataIfNecessary()
               this.checkForStaleAssignment()
 
-              /** @type {{topic: string, partitions: { partition: number; fetchOffset: string; maxBytes: number }[]} */
-              const requestsForNode = []
-
-              for (const topicPartition of this.subscriptionState.active()) {
+              for (const { topic, partitions } of this.subscriptionState.active()) {
                 const partitionsForNode =
-                  this.findReadReplicaForPartitions(
-                    topicPartition.topic,
-                    topicPartition.partitions
-                  )[nodeId] || []
+                  this.findReadReplicaForPartitions(topic, partitions)[nodeId] || []
 
-                const partitions = partitionsForNode.map(partition => ({
+                if (!partitionsForNode.length) continue
+
+                // Seeks
+                for (const partition of partitionsForNode) {
+                  if (this.seekOffset.has(topic, partition)) {
+                    const offset = this.seekOffset.remove(topic, partition)
+                    this.logger.debug('Seek offset', {
+                      groupId: this.groupId,
+                      memberId: this.memberId,
+                      seek: { topic, partition, offset },
+                    })
+                    await this.offsetManager.seek({ topic, partition, offset })
+                  }
+                }
+
+                const requestPartitions = partitionsForNode.map(partition => ({
                   partition,
-                  fetchOffset: this.offsetManager
-                    .nextOffset(topicPartition.topic, partition)
-                    .toString(),
+                  fetchOffset: this.offsetManager.nextOffset(topic, partition).toString(),
                   maxBytes: maxBytesPerPartition,
                 }))
 
-                requestsForNode.push({ topic: topicPartition.topic, partitions })
+                requestsForNode.push({ topic, partitions: requestPartitions })
               }
 
               if (requestsForNode.length === 0) return { requestsForNode, responses: [] }
 
-              for (const { topic, partitions } of requestsForNode) {
-                for (const partition of partitions) {
-                  if (this.seekOffset.has(topic, partition)) {
-                    const seekEntry = this.seekOffset.remove(topic, partition)
-                    this.logger.debug('Seek offset', {
-                      groupId: this.groupId,
-                      memberId: this.memberId,
-                      seek: seekEntry,
-                    })
-                    await this.offsetManager.seek(seekEntry)
-                  }
-                }
-              }
-
               const broker = await this.cluster.findBroker({ nodeId })
-              const response = await broker.fetch({
+              const { responses } = await broker.fetch({
                 maxWaitTime,
                 minBytes,
                 maxBytes,
@@ -521,10 +520,13 @@ module.exports = class ConsumerGroup {
               })
               return {
                 requestsForNode,
-                responses: response.responses,
+                responses,
               }
             } catch (e) {
-              return await this.recoverFromFetch(e, bail, retryCount, retryTime)
+              return {
+                requestsForNode,
+                responses: await this.recoverFromFetch(e, bail, retryCount, retryTime),
+              }
             }
           }
         )
@@ -551,7 +553,8 @@ module.exports = class ConsumerGroup {
 
         for (const batch of flatten(batchesPerPartition)) yield batch
 
-        if (requestsForNode.length === 0) await sleep(this.maxWaitTime) // Prevent busy-loop if no request actually made
+        // Prevent busy-loop if no request actually made
+        if (requestsForNode.length === 0) await sleep(this.maxWaitTime)
 
         // At this point all batches have been processed - safe to move partitions between brokers
         filteredTopicPartitions.forEach(({ topicName, partitions }) => {

@@ -97,6 +97,7 @@ describe('Consumer', () => {
       consumer.seek({ topic: topicName, partition: 0, offset: 1 })
 
       await waitForConsumerToJoinGroup(consumer)
+      await sleep(3000)
       await expect(waitForMessages(messagesConsumed, { number: 2 })).resolves.toEqual([
         {
           topic: topicName,
