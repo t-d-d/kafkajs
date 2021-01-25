@@ -8,13 +8,15 @@ module.exports = class SeekOffsets {
     this.offsets[topic][partition] = offset
   }
 
+  get(topic, partition, offset) {
+    return this.has(topic, partition) ? this.offsets[topic][partition] : null
+  }
+
   has(topic, partition) {
     return this.offsets[topic] && this.offsets[topic][partition]
   }
 
-  remove(topic, partition) {
-    const oldOffset = this.offsets[topic][partition]
+  del(topic, partition) {
     delete this.offsets[topic][partition]
-    return oldOffset
   }
 }

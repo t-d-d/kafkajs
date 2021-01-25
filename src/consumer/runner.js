@@ -14,6 +14,7 @@ const isRebalancing = e =>
   e.type === 'REBALANCE_IN_PROGRESS' || e.type === 'NOT_COORDINATOR_FOR_GROUP'
 
 const isKafkaJSError = e => e instanceof KafkaJSError
+const isSameOffset = (offsetA, offsetB) => Long.fromValue(offsetA).equals(Long.fromValue(offsetB))
 
 module.exports = class Runner extends EventEmitter {
   /**
@@ -75,21 +76,29 @@ module.exports = class Runner extends EventEmitter {
   }
 
   async start() {
-    if (this.running) return
+    if (this.running) {
+      return
+    }
 
     this.logger.debug('start consumer group', {
       groupId: this.consumerGroup.groupId,
       memberId: this.consumerGroup.memberId,
     })
 
-    this.running = true
+    try {
+      const batchIterator = await this.consumerGroup.connect()
 
-    const batchIterator = await this.consumerGroup.connect().catch(this.onCrash)
-    this.promiseToEnd = this.runLoop(batchIterator)
+      this.running = true
+      this.promiseToEnd = this.runLoop(batchIterator)
+    } catch (e) {
+      this.onCrash(e)
+    }
   }
 
   async stop() {
-    if (!this.running) return
+    if (!this.running) {
+      return
+    }
 
     this.logger.debug('waiting for consumer to finish...', {
       groupId: this.consumerGroup.groupId,
@@ -99,8 +108,10 @@ module.exports = class Runner extends EventEmitter {
     this.running = false
 
     try {
-      await this.consumerGroup.disconnect()
+      this.consumerGroup.stop()
       await this.promiseToEnd
+      await this.autoCommitOffsets()
+      await this.consumerGroup.disconnect()
 
       this.logger.debug('stop consumer group', {
         groupId: this.consumerGroup.groupId,
@@ -238,38 +249,9 @@ module.exports = class Runner extends EventEmitter {
     }
   }
 
-  resolveBatchOffset(batch) {
-    const { topic, partition } = batch
-    const lastFilteredOffset = batch.messages.length
-      ? Long.fromValue(batch.messages[batch.messages.length - 1].offset)
-      : null
-
-    return function resolveOffsetAndControlRecord(offset) {
-      /**
-       * The transactional producer generates a control record after committing the transaction.
-       * The control record is the last record on the RecordBatch, and it is filtered before it
-       * reaches the eachBatch callback. When disabling auto-resolve, the user-land code won't
-       * be able to resolve the control record offset, since it never reaches the callback,
-       * causing stuck consumers as the consumer will never move the offset marker.
-       *
-       * When the last offset of the batch is resolved, we should automatically resolve
-       * the control record offset as this entry doesn't have any meaning to the user-land code,
-       * and won't interfere with the stream processing.
-       *
-       * @see https://github.com/apache/kafka/blob/9aa660786e46c1efbf5605a6a69136a1dac6edb9/clients/src/main/java/org/apache/kafka/clients/consumer/internals/Fetcher.java#L1499-L1505
-       */
-      const offsetToResolve =
-        lastFilteredOffset && Long.fromValue(offset).equals(lastFilteredOffset)
-          ? batch.lastOffset()
-          : offset
-
-      this.consumerGroup.resolveOffset({ topic, partition, offset: offsetToResolve })
-    }.bind(this)
-  }
-
   async processEachMessage(batch) {
     const { topic, partition } = batch
-    const resolveOffset = this.resolveBatchOffset(batch)
+    const lastFilteredMessage = batch.messages[batch.messages.length - 1]
 
     for (const message of batch.messages) {
       if (!this.running || this.consumerGroup.hasSeekOffset({ topic, partition })) {
@@ -278,7 +260,11 @@ module.exports = class Runner extends EventEmitter {
 
       await this.eachMessage({ topic, partition, message })
 
-      resolveOffset(message.offset)
+      this.consumerGroup.resolveOffset({
+        topic,
+        partition,
+        offset: message === lastFilteredMessage ? batch.lastOffset() : message.offset,
+      })
       await this.consumerGroup.heartbeat({ interval: this.heartbeatInterval })
       await this.autoCommitOffsetsIfNecessary()
     }
@@ -286,11 +272,31 @@ module.exports = class Runner extends EventEmitter {
 
   async processEachBatch(batch) {
     const { topic, partition } = batch
-    const resolveOffset = this.resolveBatchOffset(batch)
+    const lastFilteredMessage = batch.messages[batch.messages.length - 1]
 
     await this.eachBatch({
       batch,
-      resolveOffset,
+      resolveOffset: offset => {
+        /**
+         * The transactional producer generates a control record after committing the transaction.
+         * The control record is the last record on the RecordBatch, and it is filtered before it
+         * reaches the eachBatch callback. When disabling auto-resolve, the user-land code won't
+         * be able to resolve the control record offset, since it never reaches the callback,
+         * causing stuck consumers as the consumer will never move the offset marker.
+         *
+         * When the last offset of the batch is resolved, we should automatically resolve
+         * the control record offset as this entry doesn't have any meaning to the user-land code,
+         * and won't interfere with the stream processing.
+         *
+         * @see https://github.com/apache/kafka/blob/9aa660786e46c1efbf5605a6a69136a1dac6edb9/clients/src/main/java/org/apache/kafka/clients/consumer/internals/Fetcher.java#L1499-L1505
+         */
+        const offsetToResolve =
+          lastFilteredMessage && isSameOffset(offset, lastFilteredMessage.offset)
+            ? batch.lastOffset()
+            : offset
+
+        this.consumerGroup.resolveOffset({ topic, partition, offset: offsetToResolve })
+      },
       heartbeat: async () => {
         await this.consumerGroup.heartbeat({ interval: this.heartbeatInterval })
       },

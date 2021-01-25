@@ -13,15 +13,7 @@ const Batch = require('./batch')
 const SeekOffsets = require('./seekOffsets')
 const SubscriptionState = require('./subscriptionState')
 const {
-  events: {
-    GROUP_JOIN,
-    HEARTBEAT,
-    CONNECT,
-    DISCONNECT,
-    RECEIVED_UNSUBSCRIBED_TOPICS,
-    FETCH_START,
-    FETCH,
-  },
+  events: { GROUP_JOIN, HEARTBEAT, CONNECT, RECEIVED_UNSUBSCRIBED_TOPICS, FETCH_START, FETCH },
 } = require('./instrumentationEvents')
 const { MemberAssignment } = require('./assignerProtocol')
 const {
@@ -137,9 +129,9 @@ module.exports = class ConsumerGroup {
     await this.cluster.connect()
     this.instrumentationEmitter.emit(CONNECT)
 
-    const metadata = await this.cluster.metadata()
+    const { brokers } = await this.cluster.metadata()
     const batchIterator = parallelMerge(
-      ...metadata.brokers.map(({ nodeId }) => this[PRIVATE.getBrokerAsyncGenerator](nodeId)())
+      ...brokers.map(({ nodeId }) => this[PRIVATE.getBrokerAsyncGenerator](nodeId)())
     )
     this.running = true
 
@@ -148,9 +140,12 @@ module.exports = class ConsumerGroup {
     return batchIterator
   }
 
-  async disconnect() {
+  stop() {
     this.running = false
-    this.instrumentationEmitter.emit(DISCONNECT)
+  }
+
+  async disconnect() {
+    this.stop()
     await this.leave()
   }
 
@@ -364,6 +359,13 @@ module.exports = class ConsumerGroup {
   }
 
   /**
+   * @param {import("../../types").TopicPartition} topicPartition
+   */
+  resetOffset({ topic, partition }) {
+    this.offsetManager.resetOffset({ topic, partition })
+  }
+
+  /**
    * @param {import("../../types").TopicPartitionOffset} topicPartitionOffset
    */
   resolveOffset({ topic, partition, offset }) {
@@ -437,11 +439,7 @@ module.exports = class ConsumerGroup {
   [PRIVATE.emitBrokerFetchStart]({ nodeId }) {
     const emitAndReset = () => {
       this.instrumentationEmitter.emit(FETCH_START, {})
-      this.instrumentationEmitter.emit(FETCH, {
-        duration: 1,
-        numberOfBatches: 0,
-      })
-      this.brokerFetchStarts = Object.keys(this.brokerAsyncIterators).reduce(
+      this.brokerFetchEnds = Object.keys(this.brokerAsyncIterators).reduce(
         (a, brokerId) => ({
           ...a,
           [brokerId]: 0,
@@ -450,16 +448,44 @@ module.exports = class ConsumerGroup {
       )
     }
 
-    if (!this.brokerFetchStarts) {
+    if (!this.brokerFetchEnds) {
       // First time through
       emitAndReset()
-      this.brokerFetchStarts[nodeId]++
+      this.brokerFetchEnds[nodeId]++
       return
     }
 
-    this.brokerFetchStarts[nodeId]++
-    if (Object.values(this.brokerFetchStarts).every(count => count > 0)) {
+    this.brokerFetchEnds[nodeId]++
+    if (Object.values(this.brokerFetchEnds).every(count => count > 0)) {
       emitAndReset()
+    }
+  }
+
+  [PRIVATE.emitBrokerFetchEnd]({ nodeId }) {
+    const reset = () => {
+      this.brokerFetchEnds = Object.keys(this.brokerAsyncIterators).reduce(
+        (a, brokerId) => ({
+          ...a,
+          [brokerId]: 0,
+        }),
+        {}
+      )
+    }
+
+    if (!this.brokerFetchEnds) {
+      // First time through
+      reset()
+      this.brokerFetchEnds[nodeId]++
+      return
+    }
+
+    this.brokerFetchEnds[nodeId]++
+    if (Object.values(this.brokerFetchEnds).every(count => count > 0)) {
+      this.instrumentationEmitter.emit(FETCH, {
+        duration: 1,
+        numberOfBatches: 0,
+      })
+      reset()
     }
   }
 
@@ -479,24 +505,28 @@ module.exports = class ConsumerGroup {
               await this.cluster.refreshMetadataIfNecessary()
               this.checkForStaleAssignment()
 
-              for (const { topic, partitions } of this.subscriptionState.active()) {
+              // Seeks for partition on this node
+              for (const { topic, partitions } of this.subscriptionState.assigned()) {
                 const partitionsForNode =
                   this.findReadReplicaForPartitions(topic, partitions)[nodeId] || []
-
-                if (!partitionsForNode.length) continue
-
-                // Seeks
                 for (const partition of partitionsForNode) {
-                  if (this.seekOffset.has(topic, partition)) {
-                    const offset = this.seekOffset.remove(topic, partition)
+                  const offset = this.seekOffset.get(topic, partition)
+                  if (offset != null) {
                     this.logger.debug('Seek offset', {
                       groupId: this.groupId,
                       memberId: this.memberId,
                       seek: { topic, partition, offset },
                     })
                     await this.offsetManager.seek({ topic, partition, offset })
+                    this.seekOffset.del(topic, partition)
                   }
                 }
+              }
+
+              // partition request for this node
+              for (const { topic, partitions } of this.subscriptionState.active()) {
+                const partitionsForNode =
+                  this.findReadReplicaForPartitions(topic, partitions)[nodeId] || []
 
                 const requestPartitions = partitionsForNode.map(partition => ({
                   partition,
@@ -504,7 +534,8 @@ module.exports = class ConsumerGroup {
                   maxBytes: maxBytesPerPartition,
                 }))
 
-                requestsForNode.push({ topic, partitions: requestPartitions })
+                if (requestPartitions.length)
+                  requestsForNode.push({ topic, partitions: requestPartitions })
               }
 
               if (requestsForNode.length === 0) return { requestsForNode, responses: [] }
@@ -530,6 +561,7 @@ module.exports = class ConsumerGroup {
             }
           }
         )
+        this[PRIVATE.emitBrokerFetchEnd]({ nodeId })
 
         const filteredTopicPartitions = responses.map(({ topicName, partitions }) => ({
           topicName,

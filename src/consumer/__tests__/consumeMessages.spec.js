@@ -261,8 +261,9 @@ describe('Consumer', () => {
 
     // stop the consumer right after processing the batch, the offsets should be
     // committed in the end
+    let promiseToStop
     consumer.on(consumer.events.END_BATCH_PROCESS, async () => {
-      await consumer.stop()
+      promiseToStop = consumer.stop()
     })
 
     const messages = Array(100)
@@ -298,6 +299,7 @@ describe('Consumer', () => {
     })
 
     // check if all offsets are present
+    await promiseToStop
     expect(messagesConsumed.map(m => m.message.offset)).toEqual(messages.map((_, i) => `${i}`))
     const [partition] = await admin.fetchOffsets({ groupId, topic: topicName })
     expect(partition.offset).toEqual('100') // check if offsets were committed
