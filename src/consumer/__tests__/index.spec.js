@@ -4,49 +4,68 @@ const {
   createTopic,
   newLogger,
   waitForConsumerToJoinGroup,
+  generateMessages,
 } = require('testHelpers')
 const createConsumer = require('../index')
+const createProducer = require('../../producer')
 
 describe('Consumer', () => {
   let topicName, groupId, consumer
 
-  describe('#run', () => {
-    beforeEach(async () => {
-      topicName = `test-topic-${secureRandom()}`
-      groupId = `consumer-group-id-${secureRandom()}`
-
-      await createTopic({ topic: topicName })
-      consumer = createConsumer({
-        cluster: createCluster({ metadataMaxAge: 50 }),
-        groupId,
-        heartbeatInterval: 100,
-        maxWaitTimeInMs: 100,
-        logger: newLogger(),
-      })
+  beforeEach(async () => {
+    topicName = `test-topic-${secureRandom()}`
+    groupId = `consumer-group-id-${secureRandom()}`
+    const cluster = createCluster({ metadataMaxAge: 50 })
+    await createTopic({ topic: topicName })
+    const producer = createProducer({
+      cluster,
+      logger: newLogger(),
+    })
+    await producer.connect()
+    await producer.send({
+      acks: 1,
+      topic: topicName,
+      messages: generateMessages(),
     })
 
-    afterEach(async () => {
-      consumer && (await consumer.disconnect())
+    consumer = createConsumer({
+      cluster,
+      groupId,
+      heartbeatInterval: 100,
+      maxWaitTimeInMs: 100,
+      logger: newLogger(),
     })
+  })
 
-    describe('when the consumer is already running', () => {
-      it('ignores the call', async () => {
-        await consumer.connect()
-        await consumer.subscribe({ topic: topicName, fromBeginning: true })
-        const eachMessage = jest.fn()
+  afterEach(async () => {
+    consumer && (await consumer.disconnect())
+  })
 
-        Promise.all([
-          consumer.run({ eachMessage }),
-          consumer.run({ eachMessage }),
-          consumer.run({ eachMessage }),
-        ])
+  it('when the consumer is already running, ignore subsequent run() calls', async () => {
+    await consumer.connect()
+    await consumer.subscribe({ topic: topicName, fromBeginning: true })
+    const eachMessage = jest.fn()
 
-        // Since the consumer gets overridden, it will fail to join the group
-        // as three other consumers will also try to join. This case is hard to write a test
-        // since we can only assert the symptoms of the problem, but we can't assert that
-        // we don't initialize the consumer.
-        await waitForConsumerToJoinGroup(consumer)
-      })
-    })
+    Promise.all([
+      consumer.run({ eachMessage }),
+      consumer.run({ eachMessage }),
+      consumer.run({ eachMessage }),
+    ])
+
+    // Since the consumer gets overridden, it will fail to join the group
+    // as three other consumers will also try to join. This case is hard to write a test
+    // since we can only assert the symptoms of the problem, but we can't assert that
+    // we don't initialize the consumer.
+    await waitForConsumerToJoinGroup(consumer)
+  })
+
+  it('when the consumer is running, can immediately stop the consumer', async () => {
+    const eachMessage = jest.fn()
+    await consumer.connect()
+    await consumer.subscribe({ topic: topicName, fromBeginning: true })
+    await consumer.run({ eachMessage })
+    await consumer.stop()
+    await consumer.disconnect()
+    expect(eachMessage).not.toHaveBeenCalled()
   })
 })
