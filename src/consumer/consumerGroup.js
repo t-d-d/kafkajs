@@ -42,9 +42,8 @@ const PRIVATE = {
   SYNC: Symbol('private:ConsumerGroup:sync'),
   getBrokerAsyncGenerator: Symbol('private:ConsumerGroup:createBrokerAsyncIterator'),
   emitBrokerFetchStart: Symbol('private:ConsumerGroup:emitBrokerFetchStart'),
-  HEARTBEAT: Symbol('private:ConsumerGroup:heartbeat'),
   SHAREDHEARTBEAT: Symbol('private:ConsumerGroup:sharedHeartbeat'),
-  JOINANDSYNC: Symbol('private:ConsumerGroup:sharedJoinAndSync'),
+  SHAREDJOINANDSYNC: Symbol('private:ConsumerGroup:sharedJoinAndSync'),
 }
 
 module.exports = class ConsumerGroup {
@@ -374,7 +373,7 @@ module.exports = class ConsumerGroup {
   }
 
   async joinAndSync() {
-    return this[PRIVATE.JOINANDSYNC]()
+    return this[PRIVATE.SHAREDJOINANDSYNC]()
   }
 
   /**
