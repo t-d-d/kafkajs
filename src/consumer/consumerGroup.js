@@ -42,8 +42,12 @@ const PRIVATE = {
   SYNC: Symbol('private:ConsumerGroup:sync'),
   getBrokerAsyncGenerator: Symbol('private:ConsumerGroup:createBrokerAsyncIterator'),
   emitBrokerFetchStart: Symbol('private:ConsumerGroup:emitBrokerFetchStart'),
-  SHAREDHEARTBEAT: Symbol('private:ConsumerGroup:sharedHeartbeat'),
-  SHAREDJOINANDSYNC: Symbol('private:ConsumerGroup:sharedJoinAndSync'),
+  sharedHeartbeat: Symbol('private:ConsumerGroup:sharedHeartbeat'),
+  sharedJoinAndSync: Symbol('private:ConsumerGroup:sharedJoinAndSync'),
+  sharedRefreshMetadata: Symbol('private:ConsumerGroup:sharedRefreshMetadata'),
+  sharedRefreshMetadataIfNecessary: Symbol(
+    'private:ConsumerGroup:sharedRefreshMetadataIfNecessary'
+  ),
 }
 
 module.exports = class ConsumerGroup {
@@ -119,6 +123,7 @@ module.exports = class ConsumerGroup {
 
     this.brokerAsyncIterators = {}
 
+    this.rebalanceRequired = true
     this[PRIVATE.JOINANDSYNC] = sharedPromiseTo(async () => {
       const startJoin = Date.now()
       return this.retrier(async bail => {
@@ -143,6 +148,7 @@ module.exports = class ConsumerGroup {
 
           this.instrumentationEmitter.emit(GROUP_JOIN, payload)
           this.logger.info('Consumer has joined the group', payload)
+          this.rebalanceRequired = false
 
           await this.offsetManager.resolveOffsets() // TODO Is this correct place?
         } catch (e) {
@@ -159,7 +165,7 @@ module.exports = class ConsumerGroup {
       })
     })
 
-    this[PRIVATE.SHAREDHEARTBEAT] = sharedPromiseTo(async ({ interval }) => {
+    this[PRIVATE.sharedHeartbeat] = sharedPromiseTo(async ({ interval }) => {
       const { groupId, generationId, memberId } = this
       const now = Date.now()
 
@@ -175,6 +181,11 @@ module.exports = class ConsumerGroup {
         this.lastRequest = Date.now()
       }
     })
+
+    this[PRIVATE.sharedRefreshMetadata] = sharedPromiseTo(() => this.cluster.refreshMetadata())
+    this[PRIVATE.sharedRefreshMetadataIfNecessary] = sharedPromiseTo(() =>
+      this.cluster.refreshMetadataIfNecessary()
+    )
   }
 
   isLeader() {
@@ -372,8 +383,8 @@ module.exports = class ConsumerGroup {
     })
   }
 
-  async joinAndSync() {
-    return this[PRIVATE.SHAREDJOINANDSYNC]()
+  setRebalanceRequired() {
+    this.rebalanceRequired = true
   }
 
   /**
@@ -436,7 +447,7 @@ module.exports = class ConsumerGroup {
   }
 
   async heartbeat({ interval }) {
-    return this[PRIVATE.SHAREDHEARTBEAT]({ interval })
+    return this[PRIVATE.sharedHeartbeat]({ interval })
   }
 
   [PRIVATE.emitBrokerFetchStart]({ nodeId }) {
@@ -505,8 +516,10 @@ module.exports = class ConsumerGroup {
             const requestsForNode = []
 
             try {
-              await this.cluster.refreshMetadataIfNecessary()
+              await this[PRIVATE.sharedRefreshMetadataIfNecessary]()
               this.checkForStaleAssignment()
+
+              if (this.rebalanceRequired) await this[PRIVATE.sharedJoinAndSync]()
 
               // Seeks for partition on this node
               for (const { topic, partitions } of this.subscriptionState.assigned()) {
@@ -638,9 +651,9 @@ module.exports = class ConsumerGroup {
         error: e.message,
       })
 
-      await this.cluster.refreshMetadata()
-      await this.joinAndSync()
-      throw new KafkaJSError(e.message)
+      await this[PRIVATE.sharedRefreshMetadata]
+      this.setRebalanceRequired()
+      return []
     }
 
     if (e.name === 'KafkaJSOffsetOutOfRange') {
@@ -656,7 +669,8 @@ module.exports = class ConsumerGroup {
         unknownPartitions: e.unknownPartitions,
       })
 
-      await this.joinAndSync()
+      this.setRebalanceRequired()
+      return []
     }
 
     if (e.name === 'KafkaJSConnectionClosedError') {
@@ -665,7 +679,7 @@ module.exports = class ConsumerGroup {
 
     if (e.name === 'KafkaJSBrokerNotFound' || e.name === 'KafkaJSConnectionClosedError') {
       this.logger.debug(`${e.message}, refreshing metadata and retrying...`)
-      await this.cluster.refreshMetadata()
+      await this[PRIVATE.sharedRefreshMetadata]
     }
 
     this.logger.debug('Error while fetching data, trying again...', {

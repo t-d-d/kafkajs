@@ -59,20 +59,8 @@ module.exports = class Runner extends EventEmitter {
     this.running = false
   }
 
-  async join() {
-    await this.consumerGroup.joinAndSync()
-  }
-
-  async scheduleJoin() {
-    if (!this.running) {
-      this.logger.debug('consumer not running, exiting', {
-        groupId: this.consumerGroup.groupId,
-        memberId: this.consumerGroup.memberId,
-      })
-      return
-    }
-
-    return this.join().catch(this.onCrash)
+  join() {
+    this.consumerGroup.setRebalanceRequired()
   }
 
   async start() {
@@ -144,7 +132,7 @@ module.exports = class Runner extends EventEmitter {
               retryTime,
             })
 
-            await this.join()
+            this.join()
             return
           }
 
@@ -158,7 +146,7 @@ module.exports = class Runner extends EventEmitter {
             })
 
             this.consumerGroup.memberId = null
-            await this.join()
+            this.join()
             return
           }
 
@@ -370,7 +358,7 @@ module.exports = class Runner extends EventEmitter {
             retryTime,
           })
 
-          setImmediate(() => this.scheduleJoin())
+          this.join()
 
           bail(new KafkaJSError(e))
         }
@@ -385,7 +373,7 @@ module.exports = class Runner extends EventEmitter {
           })
 
           this.consumerGroup.memberId = null
-          setImmediate(() => this.scheduleJoin())
+          this.join()
 
           bail(new KafkaJSError(e))
         }
