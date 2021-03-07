@@ -44,6 +44,7 @@ const PRIVATE = {
   emitBrokerFetchStart: Symbol('private:ConsumerGroup:emitBrokerFetchStart'),
   HEARTBEAT: Symbol('private:ConsumerGroup:heartbeat'),
   SHAREDHEARTBEAT: Symbol('private:ConsumerGroup:sharedHeartbeat'),
+  JOINANDSYNC: Symbol('private:ConsumerGroup:sharedJoinAndSync'),
 }
 
 module.exports = class ConsumerGroup {
@@ -117,10 +118,48 @@ module.exports = class ConsumerGroup {
 
     this.running = true
 
-    this.sharedPromiseToToHeartbeat = sharedPromiseTo()
-    this.sharedPromiseToToJoinAndSync = sharedPromiseTo()
-
     this.brokerAsyncIterators = {}
+
+    this[PRIVATE.JOINANDSYNC] = sharedPromiseTo(async () => {
+      const startJoin = Date.now()
+      return this.retrier(async bail => {
+        try {
+          await this[PRIVATE.JOIN]()
+          await this[PRIVATE.SYNC]()
+
+          const memberAssignment = this.assigned().reduce(
+            (result, { topic, partitions }) => ({ ...result, [topic]: partitions }),
+            {}
+          )
+
+          const payload = {
+            groupId: this.groupId,
+            memberId: this.memberId,
+            leaderId: this.leaderId,
+            isLeader: this.isLeader(),
+            memberAssignment,
+            groupProtocol: this.groupProtocol,
+            duration: Date.now() - startJoin,
+          }
+
+          this.instrumentationEmitter.emit(GROUP_JOIN, payload)
+          this.logger.info('Consumer has joined the group', payload)
+
+          await this.offsetManager.resolveOffsets() // TODO Is this correct place?
+        } catch (e) {
+          if (isRebalancing(e)) {
+            // Rebalance in progress isn't a retriable protocol error since the consumer
+            // has to go through find coordinator and join again before it can
+            // actually retry the operation. We wrap the original error in a retriable error
+            // here instead in order to restart the join + sync sequence using the retrier.
+            throw new KafkaJSError(e)
+          }
+
+          bail(e)
+        }
+      })
+    })
+
     this[PRIVATE.SHAREDHEARTBEAT] = sharedPromiseTo(async ({ interval }) => {
       const { groupId, generationId, memberId } = this
       const now = Date.now()
@@ -335,45 +374,7 @@ module.exports = class ConsumerGroup {
   }
 
   async joinAndSync() {
-    return await this.sharedPromiseToToJoinAndSync(async () => {
-      const startJoin = Date.now()
-      return this.retrier(async bail => {
-        try {
-          await this[PRIVATE.JOIN]()
-          await this[PRIVATE.SYNC]()
-
-          const memberAssignment = this.assigned().reduce(
-            (result, { topic, partitions }) => ({ ...result, [topic]: partitions }),
-            {}
-          )
-
-          const payload = {
-            groupId: this.groupId,
-            memberId: this.memberId,
-            leaderId: this.leaderId,
-            isLeader: this.isLeader(),
-            memberAssignment,
-            groupProtocol: this.groupProtocol,
-            duration: Date.now() - startJoin,
-          }
-
-          this.instrumentationEmitter.emit(GROUP_JOIN, payload)
-          this.logger.info('Consumer has joined the group', payload)
-
-          await this.offsetManager.resolveOffsets() // TODO Is this correct place?
-        } catch (e) {
-          if (isRebalancing(e)) {
-            // Rebalance in progress isn't a retriable protocol error since the consumer
-            // has to go through find coordinator and join again before it can
-            // actually retry the operation. We wrap the original error in a retriable error
-            // here instead in order to restart the join + sync sequence using the retrier.
-            throw new KafkaJSError(e)
-          }
-
-          bail(e)
-        }
-      })
-    })
+    return this[PRIVATE.JOINANDSYNC]()
   }
 
   /**
